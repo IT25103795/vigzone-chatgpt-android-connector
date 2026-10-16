@@ -18,29 +18,33 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
     private final Handler main=new Handler(Looper.getMainLooper());
     private CustomTabsServiceConnection connection;
     private CustomTabsSession session;
-    private boolean validated,navigated,destroyed;
+    private final ChannelGate channelGate=new ChannelGate();
+    private boolean destroyed;
     public PostMessageTwaLauncher(Activity activity,Uri origin){super(activity);this.activity=activity;this.origin=origin;}
     @Override public void launch(TrustedWebActivityIntentBuilder builder,CustomTabsCallback quality,
             SplashScreenStrategy splash,Runnable completed,FallbackStrategy fallback){
         String provider=getProviderPackage();
         if(provider==null){super.launch(builder,quality,splash,completed,fallback);return;}
         CustomTabsCallback callback=new CustomTabsCallback(){
-            private void channel(){if(validated&&navigated&&session!=null&&!destroyed)session.requestPostMessageChannel(origin,origin,new Bundle());}
+            private void channel(){
+                if(session==null||destroyed||!channelGate.beginRequest())return;
+                if(!session.requestPostMessageChannel(origin,origin,new Bundle()))channelGate.rejected();
+            }
             @Override public void onNavigationEvent(int event,Bundle extras){
                 quality.onNavigationEvent(event,extras);
-                if(event==NAVIGATION_STARTED)navigated=false;
-                if(event==NAVIGATION_FINISHED){navigated=true;channel();}
+                if(event==NAVIGATION_STARTED)channelGate.navigationStarted();
+                if(event==NAVIGATION_FINISHED){channelGate.navigationFinished();channel();}
             }
             @Override public void onRelationshipValidationResult(int relation,Uri requested,boolean valid,Bundle extras){
                 quality.onRelationshipValidationResult(relation,requested,valid,extras);
-                if(relation==CustomTabsService.RELATION_USE_AS_ORIGIN&&origin.equals(requested)){validated=valid;channel();}
+                if(relation==CustomTabsService.RELATION_USE_AS_ORIGIN&&origin.equals(requested)){channelGate.validated(valid);channel();}
             }
             @Override public void onMessageChannelReady(Bundle extras){
                 quality.onMessageChannelReady(extras);
-                if(validated)try{send(new org.json.JSONObject().put("connector","vigzone-chatgpt").put("version",1));}catch(org.json.JSONException ignored){}
+                if(channelGate.isValidated())try{send(new org.json.JSONObject().put("connector","vigzone-chatgpt").put("version",1));}catch(org.json.JSONException ignored){}
             }
             @Override public void onPostMessage(String message,Bundle extras){
-                if(!validated||destroyed)return;
+                if(!channelGate.isValidated()||destroyed)return;
                 ChatGptConnector.get(activity).dispatch(activity,origin.buildUpon().path("/chat").build(),message,PostMessageTwaLauncher.this::send);
             }
         };
@@ -57,10 +61,10 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
                 };
                 if(splash!=null)splash.configureTwaBuilder(builder,session,open);else open.run();
             }
-            @Override public void onServiceDisconnected(ComponentName name){session=null;validated=false;}
+            @Override public void onServiceDisconnected(ComponentName name){session=null;channelGate.disconnected();}
         };
         if(!CustomTabsClient.bindCustomTabsService(activity,provider,connection)){connection=null;super.launch(builder,quality,splash,completed,fallback);}
     }
-    private void send(org.json.JSONObject message){main.post(()->{if(!destroyed&&validated&&session!=null)session.postMessage(message.toString(),null);});}
+    private void send(org.json.JSONObject message){main.post(()->{if(!destroyed&&channelGate.isValidated()&&session!=null)session.postMessage(message.toString(),null);});}
     @Override public void destroy(){destroyed=true;if(connection!=null){try{activity.unbindService(connection);}catch(IllegalArgumentException ignored){}connection=null;}super.destroy();}
 }
