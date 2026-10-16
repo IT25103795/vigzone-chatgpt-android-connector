@@ -4,6 +4,18 @@ import org.junit.Test;
 import static org.junit.Assert.*;
 
 public class ChannelGateTest {
+    @Test public void restoredTabDoesNotNeedAnotherNavigationToConnect() {
+        ChannelGate gate = new ChannelGate();
+        gate.tabShown(); assertFalse(gate.beginRequest());
+        gate.validated(true); assertTrue(gate.beginRequest());
+        gate.tabShown(); assertFalse(gate.beginRequest());
+    }
+    @Test public void showingATabDuringNavigationWaitsForTheNewDocument() {
+        ChannelGate gate = new ChannelGate();
+        gate.validated(true); gate.navigationStarted(); gate.tabShown();
+        assertFalse(gate.beginRequest());
+        gate.navigationFinished(); assertTrue(gate.beginRequest());
+    }
     @Test public void requestValidationCallbacksCannotRecursivelyRequestMoreChannels() {
         ChannelGate gate = new ChannelGate();
         gate.validated(true); gate.navigationFinished();

@@ -20,7 +20,17 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
     private CustomTabsServiceConnection connection;
     private CustomTabsSession session;
     private final ChannelGate channelGate=new ChannelGate();
-    private boolean destroyed;
+    private boolean destroyed, tabVisible=true;
+    private final ValidationRetry validationRetry=new ValidationRetry();
+    private void validateOrigin(){
+        if(destroyed||!tabVisible||session==null||channelGate.isValidated()
+                ||!validationRetry.begin(android.os.SystemClock.uptimeMillis()))return;
+        android.util.Log.i(TAG,"Checking browser relationship");
+        session.validateRelationship(CustomTabsService.RELATION_USE_AS_ORIGIN,origin,null);
+        // Retry both a failed result and a browser that never calls back. This
+        // never grants trust locally, and cannot recurse from validation callbacks.
+        main.postDelayed(this::validateOrigin,validationRetry.delayMillis());
+    }
     public PostMessageTwaLauncher(Activity activity,Uri origin){super(activity);this.activity=activity;this.origin=origin;}
     @Override public void launch(TrustedWebActivityIntentBuilder builder,CustomTabsCallback quality,
             SplashScreenStrategy splash,Runnable completed,FallbackStrategy fallback){
@@ -36,8 +46,10 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
             @Override public void onNavigationEvent(int event,Bundle extras){
                 android.util.Log.i(TAG,"Navigation event="+event);
                 quality.onNavigationEvent(event,extras);
-                if(event==NAVIGATION_STARTED)channelGate.navigationStarted();
-                if(event==NAVIGATION_FINISHED){channelGate.navigationFinished();channel();}
+                if(event==NAVIGATION_STARTED){channelGate.navigationStarted();if(!channelGate.isValidated())validationRetry.reset();}
+                if(event==NAVIGATION_FINISHED){channelGate.navigationFinished();validateOrigin();channel();}
+                if(event==TAB_HIDDEN)tabVisible=false;
+                if(event==TAB_SHOWN){if(!tabVisible)validationRetry.reset();tabVisible=true;channelGate.tabShown();validateOrigin();channel();}
             }
             @Override public void onRelationshipValidationResult(int relation,Uri requested,boolean valid,Bundle extras){
                 android.util.Log.i(TAG,"Relationship="+relation+" valid="+valid+" expectedOrigin="+origin.equals(requested));
@@ -59,7 +71,7 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
                 android.util.Log.i(TAG,"Browser service connected");
                 if(destroyed)return;client.warmup(0);session=client.newSession(callback,96375);
                 if(session==null){fallback.launch(activity,builder,provider,completed);return;}
-                session.validateRelationship(CustomTabsService.RELATION_USE_AS_ORIGIN,origin,null);
+                validationRetry.reset();validateOrigin();
                 new SharedPreferencesTokenStore(activity).store(Token.create(provider,activity.getPackageManager()));
                 Runnable open=()->{
                     if(destroyed||activity.isFinishing())return;
@@ -73,5 +85,5 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
         if(!CustomTabsClient.bindCustomTabsService(activity,provider,connection)){connection=null;super.launch(builder,quality,splash,completed,fallback);}
     }
     private void send(org.json.JSONObject message){main.post(()->{if(!destroyed&&channelGate.isValidated()&&session!=null)session.postMessage(message.toString(),null);});}
-    @Override public void destroy(){destroyed=true;if(connection!=null){try{activity.unbindService(connection);}catch(IllegalArgumentException ignored){}connection=null;}super.destroy();}
+    @Override public void destroy(){destroyed=true;main.removeCallbacksAndMessages(null);if(connection!=null){try{activity.unbindService(connection);}catch(IllegalArgumentException ignored){}connection=null;}super.destroy();}
 }
