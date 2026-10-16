@@ -13,6 +13,7 @@ import com.google.androidbrowserhelper.trusted.splashscreens.SplashScreenStrateg
 
 /** Keeps the existing ABH Activity lifecycle; adds an origin-validated message session. */
 public final class PostMessageTwaLauncher extends TwaLauncher {
+    private static final String TAG="VigzoneChannel";
     private final Activity activity;
     private final Uri origin;
     private final Handler main=new Handler(Looper.getMainLooper());
@@ -28,18 +29,23 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
         CustomTabsCallback callback=new CustomTabsCallback(){
             private void channel(){
                 if(session==null||destroyed||!channelGate.beginRequest())return;
-                if(!session.requestPostMessageChannel(origin,origin,new Bundle()))channelGate.rejected();
+                boolean accepted=session.requestPostMessageChannel(origin,origin,new Bundle());
+                android.util.Log.i(TAG,"Channel request accepted="+accepted);
+                if(!accepted)channelGate.rejected();
             }
             @Override public void onNavigationEvent(int event,Bundle extras){
+                android.util.Log.i(TAG,"Navigation event="+event);
                 quality.onNavigationEvent(event,extras);
                 if(event==NAVIGATION_STARTED)channelGate.navigationStarted();
                 if(event==NAVIGATION_FINISHED){channelGate.navigationFinished();channel();}
             }
             @Override public void onRelationshipValidationResult(int relation,Uri requested,boolean valid,Bundle extras){
+                android.util.Log.i(TAG,"Relationship="+relation+" valid="+valid+" expectedOrigin="+origin.equals(requested));
                 quality.onRelationshipValidationResult(relation,requested,valid,extras);
                 if(relation==CustomTabsService.RELATION_USE_AS_ORIGIN&&origin.equals(requested)){channelGate.validated(valid);channel();}
             }
             @Override public void onMessageChannelReady(Bundle extras){
+                android.util.Log.i(TAG,"Channel ready");
                 quality.onMessageChannelReady(extras);
                 if(channelGate.isValidated())try{send(new org.json.JSONObject().put("connector","vigzone-chatgpt").put("version",1));}catch(org.json.JSONException ignored){}
             }
@@ -50,6 +56,7 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
         };
         connection=new CustomTabsServiceConnection(){
             @Override public void onCustomTabsServiceConnected(ComponentName name,CustomTabsClient client){
+                android.util.Log.i(TAG,"Browser service connected");
                 if(destroyed)return;client.warmup(0);session=client.newSession(callback,96375);
                 if(session==null){fallback.launch(activity,builder,provider,completed);return;}
                 session.validateRelationship(CustomTabsService.RELATION_USE_AS_ORIGIN,origin,null);
