@@ -11,5 +11,6 @@ final class ValidationRetry {
         return true;
     }
     long delayMillis() { return Math.min(30000L, 1000L << Math.min(attempts, 5)); }
+    int attempts() { return attempts; }
     void reset() { attempts = 0; nextAttempt = 0; }
 }
