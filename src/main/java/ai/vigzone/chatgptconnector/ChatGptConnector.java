@@ -29,6 +29,7 @@ public final class ChatGptConnector {
     private final ExecutorService work=Executors.newFixedThreadPool(3);
     private final Handler main=new Handler(Looper.getMainLooper());
     private final AtomicBoolean generating=new AtomicBoolean();
+    private final java.util.concurrent.atomic.AtomicLong loginGeneration=new java.util.concurrent.atomic.AtomicLong();
     private volatile HttpURLConnection active;
     private volatile String activeRequest="",activeScope="",loginScope="",loginError="";
     private volatile ServerSocket loginListener;
@@ -82,9 +83,10 @@ public final class ChatGptConnector {
         if(item!=null)result.put("identity",item.getString("sub")+":"+item.getString("client_id")).put("email",item.optString("email"));
         return result;
     }
-    private void beginLogin(Activity activity,String scope,Uri returnUrl) throws Exception {
+    private synchronized void beginLogin(Activity activity,String scope,Uri returnUrl) throws Exception {
         SecureStore.key(scope);if(loginListener!=null)throw new IllegalStateException("Complete or cancel the sign-in already open in your browser.");
         ServerSocket listener=new ServerSocket(0,1,InetAddress.getByName("127.0.0.1"));listener.setSoTimeout(5*60*1000);loginListener=listener;loginScope=scope;loginError="";
+        long generation=loginGeneration.incrementAndGet();
         String state=random(),nonce=random(),verifier=random(),redirect="http://127.0.0.1:"+listener.getLocalPort()+"/auth/callback";
         JSONObject saved=record(scope);String client=saved==null?"dynamic_agent_client":saved.getString("client_id");
         Uri.Builder authorization=Uri.parse("https://auth.openai.com/api/accounts/authorize").buildUpon()
@@ -116,7 +118,8 @@ public final class ChatGptConnector {
                             if(!Protocol.hasScope(response.optString("scope"),"chatgpt.tokens.use.direct"))throw new SecurityException("This account did not grant ChatGPT plan usage. Eligible Plus or Pro access is required.");
                             response.put("client_id",issued).put("sub",claims.getString("sub")).put("email",claims.optString("email"))
                                     .put("expires_at",System.currentTimeMillis()+response.getLong("expires_in")*1000);
-                            store.write("account:"+SecureStore.key(scope),response);respond(socket,"ChatGPT is connected. Return to Vigzone to choose a model.",returnUrl);
+                            synchronized(ChatGptConnector.this){if(generation!=loginGeneration.get())throw new SecurityException("This sign-in was cancelled. Start a new connection if needed.");store.write("account:"+SecureStore.key(scope),response);}
+                            respond(socket,"ChatGPT is connected. Return to Vigzone to choose a model.",returnUrl);
                         }catch(Exception error){loginError=safe(error);respond(socket,loginError,returnUrl);}break;
                     }
                 }
@@ -142,9 +145,14 @@ public final class ChatGptConnector {
         if(!signature.verify(decode(parts[2])))throw new SecurityException("OpenAI identity signature was invalid.");
         JSONObject claims=new JSONObject(new String(decode(parts[1]),StandardCharsets.UTF_8));Protocol.identity(claims,client,nonce,System.currentTimeMillis()/1000);return claims;
     }
-    private static String safe(Exception error){return error instanceof SecurityException||error instanceof IllegalArgumentException||error instanceof IOException?String.valueOf(error.getMessage()):"The ChatGPT connection could not complete. Please reconnect or retry.";}
+    private static String safe(Exception error){return error instanceof SecurityException||error instanceof IllegalArgumentException||error instanceof IllegalStateException||error instanceof IOException?String.valueOf(error.getMessage()):"The ChatGPT connection could not complete. Please reconnect or retry.";}
+    private synchronized void disconnect(String scope) throws Exception {
+        if(scope.equals(loginScope)){loginGeneration.incrementAndGet();if(loginListener!=null)loginListener.close();}
+        if(scope.equals(activeScope)&&active!=null)active.disconnect();
+        store.write("account:"+SecureStore.key(scope),null);store.write("reply:"+SecureStore.key(scope),null);
+    }
     public void dispatch(Activity activity,Uri returnUrl,String raw,Reply reply){
-        if(raw==null||raw.length()>200000)return;
+        if(raw==null||raw.length()>512000)return;
         try{
             JSONObject request=new JSONObject(raw);String id=request.getString("id"),method=request.getString("method");JSONObject parameters=request.optJSONObject("params");
             if(parameters==null)parameters=new JSONObject();String scope=parameters.getString("accountId");SecureStore.key(scope);
@@ -155,7 +163,7 @@ public final class ChatGptConnector {
                 switch(method){
                     case "status":result=status(scope);break;
                     case "login":beginLogin(activity,scope,returnUrl);result=new JSONObject().put("ok",true).put("pending",true);break;
-                    case "disconnect":if(scope.equals(loginScope)&&loginListener!=null)loginListener.close();store.write("account:"+SecureStore.key(scope),null);store.write("reply:"+SecureStore.key(scope),null);result=new JSONObject().put("ok",true);break;
+                    case "disconnect":disconnect(scope);result=new JSONObject().put("ok",true);break;
                     case "models":{
                         JSONObject account=token(scope);JSONArray available=json(connect("https://api.openai.com/v1/models","GET",account.getString("access_token"),null,false)).optJSONArray("models"),models=new JSONArray();
                         if(available!=null)for(int i=0;i<available.length();i++){JSONObject item=available.getJSONObject(i);if("list".equals(item.optString("visibility"))&&!item.optString("slug").isEmpty())models.put(new JSONObject().put("id",item.getString("slug")).put("name",item.optString("display_name",item.getString("slug"))));}
@@ -197,7 +205,7 @@ public final class ChatGptConnector {
             }
             if(!complete||text.toString().trim().isEmpty())throw new IOException("ChatGPT's response was interrupted before completion. Please retry.");
             JSONObject result=new JSONObject().put("ok",true).put("content",text.toString()).put("model",model).put("requestId",activeRequest).put("conversationId",request.optString("conversationId"));
-            store.write("reply:"+SecureStore.key(scope),result);return result;
+            synchronized(this){JSONObject stillConnected=record(scope);if(stillConnected==null||!identity.equals(stillConnected.optString("sub")+":"+stillConnected.optString("client_id")))throw new SecurityException("This ChatGPT account was disconnected before the reply finished.");store.write("reply:"+SecureStore.key(scope),result);}return result;
         }finally{if(active!=null)active.disconnect();active=null;activeRequest="";activeScope="";generating.set(false);}
     }
 }
