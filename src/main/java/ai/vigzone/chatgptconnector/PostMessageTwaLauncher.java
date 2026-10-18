@@ -20,7 +20,10 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
     private final Host host;
     private static java.lang.ref.WeakReference<PostMessageTwaLauncher> active=new java.lang.ref.WeakReference<>(null);
     /** Icon launches may reuse Chrome without delivering another TAB_SHOWN callback. */
-    public static void resumeExisting(){PostMessageTwaLauncher value=active.get();if(value!=null)value.resume();}
+    public static boolean resumeExisting(){PostMessageTwaLauncher value=active.get();if(value==null||value.destroyed||value.activity.isFinishing())return false;value.resume();return true;}
+    // Rebinding a live process reuses its session. A new process must never
+    // attach to the orphaned Chrome task whose original native owner died.
+    private static final int SESSION_ID=java.util.concurrent.ThreadLocalRandom.current().nextInt(1,Integer.MAX_VALUE);
     private static final String TAG="VigzoneChannel";
     private final Activity activity;
     private final Uri origin;
@@ -178,7 +181,7 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
         connection=new CustomTabsServiceConnection(){
             @Override public void onCustomTabsServiceConnected(ComponentName name,CustomTabsClient client){
                 android.util.Log.i(TAG,"Browser service connected");
-                if(destroyed)return;client.warmup(0);session=client.newSession(callback,96375);
+                if(destroyed)return;client.warmup(0);session=client.newSession(callback,SESSION_ID);
                 if(session==null){fallback.launch(activity,builder,provider,completed);return;}
                 validationRetry.reset();validateOrigin();
                 if(opened){channelGate.tabShown();webAcknowledged=false;handshakeRetry.reset();scheduleRecovery();return;}
