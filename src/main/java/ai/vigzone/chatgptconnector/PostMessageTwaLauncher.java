@@ -100,7 +100,7 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
                 }
                 if(event==NAVIGATION_ABORTED||event==NAVIGATION_FAILED){channelGate.navigationFinished();scheduleRecovery();}
                 if(event==TAB_HIDDEN){tabVisible=false;main.removeCallbacks(recoverChannel);ConnectionReport.record(activity,"Recovery state","Paused while tab hidden");}
-                if(event==TAB_SHOWN){if(!tabVisible)validationRetry.reset();tabVisible=true;channelGate.tabShown();validateOrigin();channel();webAcknowledged=false;handshakeRetry.reset();hello();scheduleRecovery();}
+                if(event==TAB_SHOWN){if(!tabVisible)validationRetry.reset();tabVisible=true;channelGate.tabShown();validateOrigin();channel();webAcknowledged=false;handshakeNonce=java.util.UUID.randomUUID().toString();handshakeRetry.reset();hello();scheduleRecovery();}
             }
             @Override public void onRelationshipValidationResult(int relation,Uri requested,boolean valid,Bundle extras){
                 android.util.Log.i(TAG,"Relationship="+relation+" valid="+valid+" expectedOrigin="+origin.equals(requested));
@@ -121,7 +121,7 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
                 if(!channelGate.isValidated()||destroyed)return;
                 try{
                     org.json.JSONObject control=new org.json.JSONObject(message);
-                    if("vigzone-chatgpt".equals(control.optString("connector"))&&"probe".equals(control.optString("event"))){webAcknowledged=false;handshakeRetry.reset();hello();scheduleRecovery();return;}
+                    if("vigzone-chatgpt".equals(control.optString("connector"))&&"probe".equals(control.optString("event"))){webAcknowledged=false;handshakeNonce=java.util.UUID.randomUUID().toString();handshakeRetry.reset();hello();scheduleRecovery();return;}
                     if("vigzone-chatgpt".equals(control.optString("connector"))&&"ready".equals(control.optString("event"))){
                         if(!handshakeNonce.isEmpty()&&handshakeNonce.equals(control.optString("nonce"))){
                             webAcknowledged=true;main.removeCallbacks(recoverChannel);
