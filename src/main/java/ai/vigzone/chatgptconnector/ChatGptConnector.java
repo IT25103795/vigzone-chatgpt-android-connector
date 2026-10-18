@@ -20,6 +20,8 @@ import org.json.*;
 /** Open-source, on-device OAuth/Responses client. No hosted credential proxy. */
 public final class ChatGptConnector {
     public interface Reply { void send(JSONObject value); }
+    interface Connections { HttpURLConnection open(URL target) throws IOException; }
+    private static Connections connections=target->(HttpURLConnection)target.openConnection();
     private static ChatGptConnector instance;
     public static synchronized ChatGptConnector get(Context context){
         if(instance==null)instance=new ChatGptConnector(context.getApplicationContext());return instance;
@@ -34,6 +36,11 @@ public final class ChatGptConnector {
     private volatile boolean cancelled;
     private volatile String activeRequest="",activeScope="",loginScope="",loginError="";
     private volatile ServerSocket loginListener;
+    private static final int CHAT_JOB=96376;
+    private volatile Reply observer;
+    private volatile String observerId="";
+    private JSONObject generation;
+    private long checkpointAt;
     private ChatGptConnector(Context context){this.context=context;store=new SecureStore(context);}
     static byte[] decode(String value){return Base64.decode(value,Base64.URL_SAFE|Base64.NO_WRAP|Base64.NO_PADDING);}
     static String encode(byte[] value){return Base64.encodeToString(value,Base64.URL_SAFE|Base64.NO_WRAP|Base64.NO_PADDING);}
@@ -45,7 +52,7 @@ public final class ChatGptConnector {
     private static HttpURLConnection connect(String url,String method,String bearer,String body,boolean encoded) throws Exception {
         URL target=new URL(url);
         if(!"https".equals(target.getProtocol())||!("auth.openai.com".equals(target.getHost())||"api.openai.com".equals(target.getHost())))throw new SecurityException();
-        HttpURLConnection connection=(HttpURLConnection)target.openConnection();connection.setInstanceFollowRedirects(false);connection.setConnectTimeout(15000);connection.setReadTimeout(60000);connection.setRequestMethod(method);
+        HttpURLConnection connection=connections.open(target);connection.setInstanceFollowRedirects(false);connection.setConnectTimeout(15000);connection.setReadTimeout(url.endsWith("/responses")?300000:60000);connection.setRequestMethod(method);
         if(bearer!=null)connection.setRequestProperty("Authorization","Bearer "+bearer);
         if(body!=null){connection.setDoOutput(true);connection.setRequestProperty("Content-Type",encoded?"application/x-www-form-urlencoded":"application/json");try(OutputStream out=connection.getOutputStream()){out.write(body.getBytes(StandardCharsets.UTF_8));}}
         return connection;
@@ -80,7 +87,7 @@ public final class ChatGptConnector {
     }
     private JSONObject status(String scope) throws Exception {
         JSONObject item=record(scope),result=new JSONObject().put("ok",true).put("connected",item!=null).put("pending",scope.equals(loginScope)&&loginListener!=null);
-        result.put("capabilities",new JSONObject().put("webSearch",true).put("vigzoneMemory",true));
+        result.put("capabilities",new JSONObject().put("webSearch",true).put("vigzoneMemory",true).put("durableReplies",true));
         if(scope.equals(loginScope)&&!loginError.isEmpty())result.put("error",loginError);
         if(item!=null)result.put("identity",item.getString("sub")+":"+item.getString("client_id")).put("email",item.optString("email"));
         return result;
@@ -148,9 +155,86 @@ public final class ChatGptConnector {
         JSONObject claims=new JSONObject(new String(decode(parts[1]),StandardCharsets.UTF_8));Protocol.identity(claims,client,nonce,System.currentTimeMillis()/1000);return claims;
     }
     private static String safe(Exception error){return error instanceof SecurityException||error instanceof IllegalArgumentException||error instanceof IllegalStateException||error instanceof IOException?String.valueOf(error.getMessage()):"The ChatGPT connection could not complete. Please reconnect or retry.";}
+    private android.app.job.JobScheduler jobs(){return (android.app.job.JobScheduler)context.getSystemService(Context.JOB_SCHEDULER_SERVICE);}
+    private synchronized JSONObject generation() throws Exception {
+        if(generation==null)generation=store.read("generation");return generation;
+    }
+    private synchronized JSONObject snapshot(String scope) throws Exception {
+        JSONObject completed=store.read("reply:"+SecureStore.key(scope));if(completed!=null)return completed;
+        JSONObject job=generation();if(job==null||!scope.equals(job.optString("scope")))return null;
+        if("running".equals(job.optString("state"))&&!generating.get()){
+            finishInterrupted("Android stopped the previous generation. The saved partial reply is kept below; retry to continue.");
+            return store.read("reply:"+SecureStore.key(scope));
+        }
+        JSONObject request=job.getJSONObject("request");
+        return new JSONObject().put("state",job.optString("state")).put("content",job.optString("content"))
+                .put("requestId",request.getString("requestId")).put("conversationId",request.optString("conversationId"))
+                .put("model",request.optString("model"));
+    }
+    private synchronized void enqueue(String scope,String id,JSONObject request,Reply reply) throws Exception {
+        if(!request.optString("requestId").matches("[A-Za-z0-9_-]{1,120}")||request.optString("conversationId").isEmpty())throw new IllegalArgumentException("Choose a chat before sending a response request.");
+        Protocol.input(request);
+        JSONObject job=generation();
+        if(job!=null||generating.get())throw new IllegalStateException("A ChatGPT reply is still running. Return to its chat to see progress.");
+        if(store.read("reply:"+SecureStore.key(scope))!=null)throw new IllegalStateException("Recover the previous reply before sending another request.");
+        JSONObject account=record(scope);
+        if(account==null||!Protocol.equal(account.optString("sub")+":"+account.optString("client_id"),request.optString("expectedAccount")))
+            throw new SecurityException("Confirm your connected ChatGPT account before sending.");
+        generation=new JSONObject().put("scope",scope).put("request",request).put("state","queued").put("content","");
+        store.write("generation",generation);observer=reply;observerId=id;checkpointAt=0;
+        android.content.ComponentName service=new android.content.ComponentName(context,ChatJobService.class);
+        android.os.PersistableBundle extras=new android.os.PersistableBundle();extras.putString("requestId",request.getString("requestId"));
+        android.app.job.JobInfo.Builder builder=new android.app.job.JobInfo.Builder(CHAT_JOB,service)
+                .setRequiredNetworkType(android.app.job.JobInfo.NETWORK_TYPE_ANY).setExtras(extras);
+        if(android.os.Build.VERSION.SDK_INT>=31)builder.setExpedited(true);else builder.setOverrideDeadline(0);
+        int accepted=jobs().schedule(builder.build());
+        if(accepted!=android.app.job.JobScheduler.RESULT_SUCCESS&&android.os.Build.VERSION.SDK_INT>=31)
+            accepted=jobs().schedule(new android.app.job.JobInfo.Builder(CHAT_JOB,service).setRequiredNetworkType(android.app.job.JobInfo.NETWORK_TYPE_ANY).setExtras(extras).setOverrideDeadline(0).build());
+        if(accepted!=android.app.job.JobScheduler.RESULT_SUCCESS){generation=null;store.write("generation",null);throw new IOException("Android could not schedule this response. Please retry.");}
+        reply.send(snapshot(scope).put("id",id).put("event","snapshot"));
+    }
+    void runScheduled(Runnable finished){
+        work.execute(()->{
+            try{
+                JSONObject job; synchronized(this){job=generation();}
+                if(job==null)return;
+                if(!"queued".equals(job.optString("state"))){finishInterrupted("Android interrupted this response. Your saved partial reply is retained; retry to continue.");return;}
+                String scope=job.getString("scope");JSONObject request=job.getJSONObject("request");
+                JSONObject result=chat(scope,observerId,request,value->{Reply target=observer;if(target!=null)target.send(value);});
+                Reply target=observer;if(target!=null)target.send(result.put("id",observerId));
+                synchronized(this){generation=null;store.write("generation",null);}
+            }catch(Exception error){try{finishInterrupted(safe(error));}catch(Exception ignored){}}
+            finally{main.post(finished);}
+        });
+    }
+    private synchronized void progress(String content) throws Exception {
+        if(generation==null)return;boolean first=generation.optString("content").isEmpty()&&!content.isEmpty();generation.put("state","running").put("content",content);
+        long now=android.os.SystemClock.elapsedRealtime();
+        if(first||now-checkpointAt>=2000){store.write("generation",generation);checkpointAt=now;}
+    }
+    private synchronized void finishInterrupted(String error) throws Exception {
+        JSONObject job=generation();if(job==null)return;
+        JSONObject request=job.getJSONObject("request");String scope=job.getString("scope");
+        if(record(scope)!=null&&store.read("reply:"+SecureStore.key(scope))==null){
+            JSONObject result=new JSONObject().put("ok",false).put("state","interrupted").put("error",error)
+                    .put("content",job.optString("content")).put("requestId",request.getString("requestId"))
+                    .put("conversationId",request.optString("conversationId")).put("model",request.optString("model"));
+            store.write("reply:"+SecureStore.key(scope),result);
+            Reply target=observer;if(target!=null)target.send(new JSONObject(result.toString()).put("id",observerId));
+        }
+        generation=null;store.write("generation",null);
+    }
+    void interruptScheduled(){
+        cancelled=true;if(active!=null)active.disconnect();
+        try{finishInterrupted("Android paused this response before completion. The saved partial reply is retained; retry to continue.");}catch(Exception ignored){}
+    }
+    synchronized void interruptScheduled(String requestId){
+        try{JSONObject job=generation();if(job!=null&&requestId.equals(job.getJSONObject("request").optString("requestId")))interruptScheduled();}catch(Exception ignored){}
+    }
     private synchronized void disconnect(String scope) throws Exception {
         if(scope.equals(loginScope)){loginGeneration.incrementAndGet();if(loginListener!=null)loginListener.close();}
         if(scope.equals(activeScope)){cancelled=true;if(active!=null)active.disconnect();}
+        JSONObject job=generation();if(job!=null&&scope.equals(job.optString("scope"))){jobs().cancel(CHAT_JOB);generation=null;store.write("generation",null);}
         store.write("account:"+SecureStore.key(scope),null);store.write("reply:"+SecureStore.key(scope),null);
     }
     public void dispatch(Activity activity,Uri returnUrl,String raw,Reply reply){
@@ -159,7 +243,10 @@ public final class ChatGptConnector {
             JSONObject request=new JSONObject(raw);String id=request.getString("id"),method=request.getString("method");JSONObject parameters=request.optJSONObject("params");
             if(parameters==null)parameters=new JSONObject();String scope=parameters.getString("accountId");SecureStore.key(scope);
             JSONObject args=parameters;
-            if("cancel".equals(method)){if(scope.equals(activeScope)&&args.optString("requestId").equals(activeRequest)){cancelled=true;if(active!=null)active.disconnect();}reply.send(new JSONObject().put("id",id).put("ok",true));return;}
+            if("cancel".equals(method)){
+                synchronized(this){JSONObject job=generation();if(job!=null&&scope.equals(job.optString("scope"))&&args.optString("requestId").equals(job.getJSONObject("request").optString("requestId"))){jobs().cancel(CHAT_JOB);interruptScheduled();}}
+                reply.send(new JSONObject().put("id",id).put("ok",true));return;
+            }
             work.execute(()->{try{
                 JSONObject result;
                 switch(method){
@@ -171,9 +258,16 @@ public final class ChatGptConnector {
                         if(available!=null)for(int i=0;i<available.length();i++){JSONObject item=available.getJSONObject(i);if("list".equals(item.optString("visibility"))&&!item.optString("slug").isEmpty())models.put(new JSONObject().put("id",item.getString("slug")).put("name",item.optString("display_name",item.getString("slug"))));}
                         result=new JSONObject().put("ok",true).put("models",models);break;
                     }
-                    case "recover":{JSONObject cached=store.read("reply:"+SecureStore.key(scope));result=new JSONObject().put("ok",true).put("reply",cached==null?JSONObject.NULL:cached);break;}
+                    case "recover":{JSONObject cached=snapshot(scope);result=new JSONObject().put("ok",true).put("reply",cached==null?JSONObject.NULL:cached);break;}
+                    case "watch":{
+                        JSONObject cached=snapshot(scope);
+                        if(cached==null||!args.optString("requestId").equals(cached.optString("requestId")))throw new IOException("This response is no longer running. Any saved partial reply remains in your chat; retry to continue.");
+                        result=new JSONObject(cached.toString());
+                        if("running".equals(result.optString("state"))||"queued".equals(result.optString("state")))result.put("event","snapshot");
+                        break;
+                    }
                     case "ack":{String key="reply:"+SecureStore.key(scope);JSONObject cached=store.read(key);if(cached!=null&&args.optString("requestId").equals(cached.optString("requestId")))store.write(key,null);result=new JSONObject().put("ok",true);break;}
-                    case "chat":result=chat(scope,id,args,reply);break;
+                    case "chat":enqueue(scope,id,args,reply);return;
                     default:throw new IllegalArgumentException("Unsupported connector request.");
                 }
                 reply.send(result.put("id",id));
@@ -184,7 +278,11 @@ public final class ChatGptConnector {
         if(!generating.compareAndSet(false,true))throw new IllegalStateException("A ChatGPT response is already in progress.");
         try{
             if(store.read("reply:"+SecureStore.key(scope))!=null)throw new IllegalStateException("Recover the previous completed ChatGPT reply before sending another request.");
-            cancelled=false;JSONObject account=token(scope);String identity=account.getString("sub")+":"+account.getString("client_id");
+            synchronized(this){
+                if(generation==null||!scope.equals(generation.optString("scope"))||!request.optString("requestId").equals(generation.getJSONObject("request").optString("requestId")))throw new IOException("Request cancelled.");
+                cancelled=false;activeRequest=request.getString("requestId");activeScope=scope;progress("");
+            }
+            JSONObject account=token(scope);String identity=account.getString("sub")+":"+account.getString("client_id");
             if(!Protocol.equal(identity,request.optString("expectedAccount")))throw new SecurityException("Confirm your connected ChatGPT account again before sending.");
             String model=request.getString("model");if(!model.matches("[A-Za-z0-9._:/-]{1,120}"))throw new IllegalArgumentException("Choose a model reported by your ChatGPT account.");
             JSONObject payload=Protocol.payload(request,model);
@@ -213,7 +311,7 @@ public final class ChatGptConnector {
                     if(!line.isEmpty()||data.length()==0)continue;
                     if("[DONE]".contentEquals(data)){data.setLength(0);break;}
                     JSONObject event=new JSONObject(data.toString());data.setLength(0);events.accept(event);
-                    if("response.output_text.delta".equals(event.optString("type")))reply.send(new JSONObject().put("id",id).put("event","delta").put("delta",event.optString("delta")));
+                    if("response.output_text.delta".equals(event.optString("type"))){String delta=event.optString("delta");progress(events.text.toString());reply.send(new JSONObject().put("id",id).put("event","delta").put("offset",events.text.length()-delta.length()).put("delta",delta));}
                     if(events.searched&&!searchAnnounced){searchAnnounced=true;reply.send(new JSONObject().put("id",id).put("event","status").put("status","searching"));}
                     if(events.complete)break;
                 }

@@ -20,7 +20,7 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
     private CustomTabsServiceConnection connection;
     private CustomTabsSession session;
     private final ChannelGate channelGate=new ChannelGate();
-    private boolean destroyed, tabVisible=true;
+    private boolean destroyed, tabVisible=true, opened;
     private final ValidationRetry handshakeRetry=new ValidationRetry();
     private boolean webAcknowledged;
     private String handshakeNonce="";
@@ -100,7 +100,7 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
                 }
                 if(event==NAVIGATION_ABORTED||event==NAVIGATION_FAILED){channelGate.navigationFinished();scheduleRecovery();}
                 if(event==TAB_HIDDEN){tabVisible=false;main.removeCallbacks(recoverChannel);ConnectionReport.record(activity,"Recovery state","Paused while tab hidden");}
-                if(event==TAB_SHOWN){if(!tabVisible)validationRetry.reset();tabVisible=true;channelGate.tabShown();validateOrigin();channel();if(!webAcknowledged){handshakeRetry.reset();scheduleRecovery();}}
+                if(event==TAB_SHOWN){if(!tabVisible)validationRetry.reset();tabVisible=true;channelGate.tabShown();validateOrigin();channel();webAcknowledged=false;handshakeRetry.reset();hello();scheduleRecovery();}
             }
             @Override public void onRelationshipValidationResult(int relation,Uri requested,boolean valid,Bundle extras){
                 android.util.Log.i(TAG,"Relationship="+relation+" valid="+valid+" expectedOrigin="+origin.equals(requested));
@@ -121,6 +121,7 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
                 if(!channelGate.isValidated()||destroyed)return;
                 try{
                     org.json.JSONObject control=new org.json.JSONObject(message);
+                    if("vigzone-chatgpt".equals(control.optString("connector"))&&"probe".equals(control.optString("event"))){webAcknowledged=false;handshakeRetry.reset();hello();scheduleRecovery();return;}
                     if("vigzone-chatgpt".equals(control.optString("connector"))&&"ready".equals(control.optString("event"))){
                         if(!handshakeNonce.isEmpty()&&handshakeNonce.equals(control.optString("nonce"))){
                             webAcknowledged=true;main.removeCallbacks(recoverChannel);
@@ -140,15 +141,23 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
                 if(destroyed)return;client.warmup(0);session=client.newSession(callback,96375);
                 if(session==null){fallback.launch(activity,builder,provider,completed);return;}
                 validationRetry.reset();validateOrigin();
+                if(opened){channelGate.tabShown();webAcknowledged=false;handshakeRetry.reset();scheduleRecovery();return;}
                 new SharedPreferencesTokenStore(activity).store(Token.create(provider,activity.getPackageManager()));
                 Runnable open=()->{
                     if(destroyed||activity.isFinishing())return;
                     TrustedWebActivityIntent intent=builder.build(session);FocusActivity.addToIntent(intent.getIntent(),activity);intent.launchTrustedWebActivity(activity);
+                    opened=true;
                     if(completed!=null)completed.run();
                 };
                 if(splash!=null)splash.configureTwaBuilder(builder,session,open);else open.run();
             }
             @Override public void onServiceDisconnected(ComponentName name){session=null;channelGate.disconnected();ConnectionReport.record(activity,"Recovery state","Browser service disconnected");}
+            @Override public void onBindingDied(ComponentName name){
+                session=null;channelGate.disconnected();
+                if(destroyed)return;
+                try{activity.unbindService(this);}catch(IllegalArgumentException ignored){}
+                main.postDelayed(()->{if(!destroyed)CustomTabsClient.bindCustomTabsService(activity,provider,this);},2000);
+            }
         };
         if(!CustomTabsClient.bindCustomTabsService(activity,provider,connection)){connection=null;super.launch(builder,quality,splash,completed,fallback);}
     }
@@ -157,6 +166,6 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
             send(new org.json.JSONObject().put("connector","vigzone-chatgpt").put("version",1).put("nonce",handshakeNonce));
         }catch(org.json.JSONException ignored){}
     }
-    private void send(org.json.JSONObject message){main.post(()->{if(!destroyed&&channelGate.isValidated()&&session!=null)ConnectionReport.record(activity,"Native message result",Integer.toString(session.postMessage(message.toString(),null)));});}
+    private void send(org.json.JSONObject message){main.post(()->{if(!destroyed&&channelGate.isValidated()&&session!=null){int result=session.postMessage(message.toString(),null);ConnectionReport.record(activity,"Native message result",Integer.toString(result));if(result!=CustomTabsService.RESULT_SUCCESS){webAcknowledged=false;scheduleRecovery();}}});}
     @Override public void destroy(){destroyed=true;ConnectionReport.record(activity,"Recovery state","Launcher destroyed");main.removeCallbacksAndMessages(null);if(connection!=null){try{activity.unbindService(connection);}catch(IllegalArgumentException ignored){}connection=null;}super.destroy();}
 }

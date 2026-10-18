@@ -1,5 +1,6 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <application>
         <activity android:name=".ConnectionStatusActivity" android:exported="true" android:theme="@android:style/Theme.Material.NoActionBar">
             <intent-filter>
@@ -10,5 +11,6 @@
             </intent-filter>
         </activity>
         <service android:name="androidx.browser.customtabs.PostMessageService" android:exported="true" />
+        <service android:name=".ChatJobService" android:exported="true" android:permission="android.permission.BIND_JOB_SERVICE" />
     </application>
 </manifest>
