@@ -18,6 +18,9 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
         org.json.JSONObject request(Activity activity,org.json.JSONObject parameters) throws Exception;
     }
     private final Host host;
+    private static java.lang.ref.WeakReference<PostMessageTwaLauncher> active=new java.lang.ref.WeakReference<>(null);
+    /** Icon launches may reuse Chrome without delivering another TAB_SHOWN callback. */
+    public static void resumeExisting(){PostMessageTwaLauncher value=active.get();if(value!=null)value.resume();}
     private static final String TAG="VigzoneChannel";
     private final Activity activity;
     private final Uri origin;
@@ -30,6 +33,28 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
     private boolean webAcknowledged;
     private String handshakeNonce="";
     private Runnable requestChannel;
+    private Runnable reconnectBrowser;
+    private long lastAcknowledged,lastRetryReset;
+    private final Runnable monitorChannel=this::monitor;
+    private void monitor(){
+        if(destroyed||!tabVisible||active.get()!=this)return;
+        long now=android.os.SystemClock.uptimeMillis();
+        if(now-lastRetryReset>=30000&&!webAcknowledged){handshakeRetry.reset();validationRetry.reset();lastRetryReset=now;}
+        if(session==null){if(reconnectBrowser!=null)reconnectBrowser.run();}
+        else if(!channelGate.isValidated())validateOrigin();
+        else if(webAcknowledged&&now-lastAcknowledged>=15000){webAcknowledged=false;handshakeNonce=java.util.UUID.randomUUID().toString();hello();scheduleRecovery();}
+        else if(!webAcknowledged)scheduleRecovery();
+        main.postDelayed(monitorChannel,15000);
+    }
+    private void startMonitor(){main.removeCallbacks(monitorChannel);main.postDelayed(monitorChannel,15000);}
+    private void resume(){main.post(()->{
+        if(destroyed||activity.isFinishing()||active.get()!=this)return;
+        tabVisible=true;validationRetry.reset();handshakeRetry.reset();webAcknowledged=false;
+        channelGate.tabShown();handshakeNonce=java.util.UUID.randomUUID().toString();
+        if(session==null){if(reconnectBrowser!=null)reconnectBrowser.run();}
+        else{validateOrigin();hello();scheduleRecovery();}
+        startMonitor();
+    });}
     private final Runnable recoverChannel=this::recover;
     private void recover(){
         if(destroyed||!tabVisible||webAcknowledged||session==null||!channelGate.isValidated())return;
@@ -70,6 +95,7 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
     @Override public void launch(TrustedWebActivityIntentBuilder builder,CustomTabsCallback quality,
             SplashScreenStrategy splash,Runnable completed,FallbackStrategy fallback){
         String provider=getProviderPackage();
+        active=new java.lang.ref.WeakReference<>(this);
         ConnectionReport.start(activity,provider);
         if(provider==null){super.launch(builder,quality,splash,completed,fallback);return;}
         CustomTabsCallback callback=new CustomTabsCallback(){
@@ -85,6 +111,7 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
                 scheduleRecovery();
             }
             @Override public void onNavigationEvent(int event,Bundle extras){
+                if(destroyed||active.get()!=PostMessageTwaLauncher.this)return;
                 android.util.Log.i(TAG,"Navigation event="+event);
                 ConnectionReport.record(activity,"Navigation",Integer.toString(event));
                 quality.onNavigationEvent(event,extras);
@@ -105,8 +132,8 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
                     webAcknowledged=false;handshakeRetry.reset();hello();scheduleRecovery();
                 }
                 if(event==NAVIGATION_ABORTED||event==NAVIGATION_FAILED){channelGate.navigationFinished();scheduleRecovery();}
-                if(event==TAB_HIDDEN){tabVisible=false;if(host!=null)host.visibility(false);main.removeCallbacks(recoverChannel);ConnectionReport.record(activity,"Recovery state","Paused while tab hidden");}
-                if(event==TAB_SHOWN){if(host!=null)host.visibility(true);if(!tabVisible)validationRetry.reset();tabVisible=true;channelGate.tabShown();validateOrigin();channel();webAcknowledged=false;handshakeNonce=java.util.UUID.randomUUID().toString();handshakeRetry.reset();hello();scheduleRecovery();}
+                if(event==TAB_HIDDEN){tabVisible=false;if(host!=null)host.visibility(false);main.removeCallbacks(recoverChannel);main.removeCallbacks(monitorChannel);ConnectionReport.record(activity,"Recovery state","Paused while tab hidden");}
+                if(event==TAB_SHOWN){if(host!=null)host.visibility(true);if(!tabVisible)validationRetry.reset();tabVisible=true;channelGate.tabShown();validateOrigin();channel();webAcknowledged=false;handshakeNonce=java.util.UUID.randomUUID().toString();handshakeRetry.reset();hello();scheduleRecovery();startMonitor();}
             }
             @Override public void onRelationshipValidationResult(int relation,Uri requested,boolean valid,Bundle extras){
                 android.util.Log.i(TAG,"Relationship="+relation+" valid="+valid+" expectedOrigin="+origin.equals(requested));
@@ -137,7 +164,7 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
                     if("vigzone-chatgpt".equals(control.optString("connector"))&&"probe".equals(control.optString("event"))){webAcknowledged=false;handshakeNonce=java.util.UUID.randomUUID().toString();handshakeRetry.reset();hello();scheduleRecovery();return;}
                     if("vigzone-chatgpt".equals(control.optString("connector"))&&"ready".equals(control.optString("event"))){
                         if(!handshakeNonce.isEmpty()&&handshakeNonce.equals(control.optString("nonce"))){
-                            webAcknowledged=true;main.removeCallbacks(recoverChannel);
+                            webAcknowledged=true;lastAcknowledged=android.os.SystemClock.uptimeMillis();main.removeCallbacks(recoverChannel);
                             ConnectionReport.record(activity,"Page acknowledgment","Received");
                             ConnectionReport.record(activity,"Recovery state","Page connected");
                         }
@@ -160,6 +187,7 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
                     if(destroyed||activity.isFinishing())return;
                     TrustedWebActivityIntent intent=builder.build(session);FocusActivity.addToIntent(intent.getIntent(),activity);intent.launchTrustedWebActivity(activity);
                     opened=true;
+                    startMonitor();
                     if(completed!=null)completed.run();
                 };
                 if(splash!=null)splash.configureTwaBuilder(builder,session,open);else open.run();
@@ -172,6 +200,11 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
                 main.postDelayed(()->{if(!destroyed)CustomTabsClient.bindCustomTabsService(activity,provider,this);},2000);
             }
         };
+        reconnectBrowser=()->{
+            if(destroyed||connection==null)return;
+            try{activity.unbindService(connection);}catch(IllegalArgumentException ignored){}
+            CustomTabsClient.bindCustomTabsService(activity,provider,connection);
+        };
         if(!CustomTabsClient.bindCustomTabsService(activity,provider,connection)){connection=null;super.launch(builder,quality,splash,completed,fallback);}
     }
     private void hello(){
@@ -180,5 +213,5 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
         }catch(org.json.JSONException ignored){}
     }
     private void send(org.json.JSONObject message){main.post(()->{if(!destroyed&&channelGate.isValidated()&&session!=null){int result=session.postMessage(message.toString(),null);ConnectionReport.record(activity,"Native message result",Integer.toString(result));if(result!=CustomTabsService.RESULT_SUCCESS){webAcknowledged=false;scheduleRecovery();}}});}
-    @Override public void destroy(){destroyed=true;if(host!=null)host.visibility(false);ConnectionReport.record(activity,"Recovery state","Launcher destroyed");main.removeCallbacksAndMessages(null);if(connection!=null){try{activity.unbindService(connection);}catch(IllegalArgumentException ignored){}connection=null;}super.destroy();}
+    @Override public void destroy(){destroyed=true;if(active.get()==this){active.clear();if(host!=null)host.visibility(false);}ConnectionReport.record(activity,"Recovery state","Launcher destroyed");main.removeCallbacksAndMessages(null);if(connection!=null){try{activity.unbindService(connection);}catch(IllegalArgumentException ignored){}connection=null;}super.destroy();}
 }

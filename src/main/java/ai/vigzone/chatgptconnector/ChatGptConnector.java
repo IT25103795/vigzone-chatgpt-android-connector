@@ -88,12 +88,19 @@ public final class ChatGptConnector {
                 .put("scope",scopes).put("expires_at",System.currentTimeMillis()+response.getLong("expires_in")*1000);
         store.write("account:"+SecureStore.key(scope),item);return item;
     }
-    private JSONObject status(String scope) throws Exception {
+    private synchronized JSONObject status(String scope) throws Exception {
         JSONObject item=record(scope),result=new JSONObject().put("ok",true).put("connected",item!=null).put("pending",scope.equals(loginScope)&&loginListener!=null);
-        result.put("capabilities",new JSONObject().put("webSearch",true).put("vigzoneMemory",true).put("durableReplies",true));
+        ConnectionReport.record(context,"Saved sign-in",item==null?"Not found for active Vigzone account":"Available on this phone");
+        result.put("capabilities",new JSONObject().put("webSearch",true).put("vigzoneMemory",true).put("durableReplies",true).put("durableSelection",true));
         if(scope.equals(loginScope)&&!loginError.isEmpty())result.put("error",loginError);
-        if(item!=null)result.put("identity",item.getString("sub")+":"+item.getString("client_id")).put("email",item.optString("email"));
+        if(item!=null)result.put("identity",item.getString("sub")+":"+item.getString("client_id")).put("email",item.optString("email")).put("selectedModel",item.optString("active_model"));
         return result;
+    }
+    private synchronized JSONObject select(String scope,JSONObject request) throws Exception {
+        JSONObject item=record(scope);String model=request.optString("model");
+        if(item==null||!Protocol.equal(item.optString("sub")+":"+item.optString("client_id"),request.optString("expectedAccount")))throw new SecurityException("Confirm your connected ChatGPT account before choosing a model.");
+        if(!model.matches("[A-Za-z0-9._:/-]{1,120}"))throw new IllegalArgumentException("Choose a model reported by your ChatGPT account.");
+        item.put("active_model",model);store.write("account:"+SecureStore.key(scope),item);return status(scope);
     }
     private synchronized void beginLogin(Activity activity,String scope,Uri returnUrl) throws Exception {
         SecureStore.key(scope);if(loginListener!=null)throw new IllegalStateException("Complete or cancel the sign-in already open in your browser.");
@@ -130,6 +137,7 @@ public final class ChatGptConnector {
                             if(!Protocol.hasScope(response.optString("scope"),"chatgpt.tokens.use.direct"))throw new SecurityException("This account did not grant ChatGPT plan usage. Eligible Plus or Pro access is required.");
                             response.put("client_id",issued).put("sub",claims.getString("sub")).put("email",claims.optString("email"))
                                     .put("expires_at",System.currentTimeMillis()+response.getLong("expires_in")*1000);
+                            if(saved!=null&&!saved.optString("active_model").isEmpty())response.put("active_model",saved.getString("active_model"));
                             synchronized(ChatGptConnector.this){if(generation!=loginGeneration.get())throw new SecurityException("This sign-in was cancelled. Start a new connection if needed.");store.write("account:"+SecureStore.key(scope),response);}
                             respond(socket,"ChatGPT is connected. Return to Vigzone to choose a model.",returnUrl);
                         }catch(Exception error){loginError=safe(error);respond(socket,loginError,returnUrl);}break;
@@ -256,6 +264,7 @@ public final class ChatGptConnector {
                 JSONObject result;
                 switch(method){
                     case "status":result=status(scope);break;
+                    case "select":result=select(scope,args);break;
                     case "login":beginLogin(activity,scope,returnUrl);result=new JSONObject().put("ok",true).put("pending",true);break;
                     case "disconnect":disconnect(scope);result=new JSONObject().put("ok",true);break;
                     case "models":{
