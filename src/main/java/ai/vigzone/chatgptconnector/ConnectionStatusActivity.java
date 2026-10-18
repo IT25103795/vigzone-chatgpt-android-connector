@@ -21,8 +21,14 @@ public final class ConnectionStatusActivity extends Activity {
                 .append("\nAndroid: ").append(android.os.Build.VERSION.RELEASE)
                 .append("\nDevice: ").append(android.os.Build.MANUFACTURER).append(' ').append(android.os.Build.MODEL);
         android.content.SharedPreferences prefs=getSharedPreferences(ConnectionReport.STORE,MODE_PRIVATE);
-        for(String key:new String[]{"Browser","Browser version","Trust check","Validation attempts","Navigation","Message channel","Native message result","Web request"})
+        for(String key:new String[]{"Browser","Browser version","Trust check","Validation attempts","Navigation","Message channel","Native message result","Page acknowledgment","Channel retries","Web request"})
             report.append('\n').append(key).append(": ").append(prefs.getString(key,"Not recorded"));
+        // Only fixed, non-sensitive transport enums can arrive from the web link.
+        for(String key:new String[]{"web_stage","web_origin"}){
+            String value=getIntent().getStringExtra(key);
+            if(value!=null&&value.matches("no-transfer|rejected-origin|rejected-source|awaiting-hello|ready|hello-timeout|none|native-exact|own|opaque|other"))
+                report.append('\n').append(key).append(": ").append(value);
+        }
         LinearLayout content=new LinearLayout(this);content.setOrientation(LinearLayout.VERTICAL);
         int pad=(int)(24*getResources().getDisplayMetrics().density);content.setPadding(pad,pad,pad,pad);
         content.setBackgroundColor(0xff17131d);
