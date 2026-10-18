@@ -26,7 +26,7 @@ public final class ConnectionStatusActivity extends Activity {
         // Only fixed, non-sensitive transport enums can arrive from the web link.
         for(String key:new String[]{"web_stage","web_origin"}){
             String value=getIntent().getStringExtra(key);
-            if(value!=null&&value.matches("no-transfer|rejected-origin|rejected-source|awaiting-hello|ready|hello-timeout|none|native-exact|own|opaque|other"))
+            if(value!=null&&value.matches("no-transfer|rejected-origin|rejected-source|awaiting-hello|ready|hello-timeout|none|native-exact|native-normalized|own|opaque|other"))
                 report.append('\n').append(key).append(": ").append(value);
         }
         LinearLayout content=new LinearLayout(this);content.setOrientation(LinearLayout.VERTICAL);
