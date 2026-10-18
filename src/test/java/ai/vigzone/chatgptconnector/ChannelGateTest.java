@@ -45,4 +45,16 @@ public class ChannelGateTest {
         gate.disconnected(); assertFalse(gate.isValidated()); assertFalse(gate.beginRequest());
         gate.navigationFinished(); gate.validated(false); assertFalse(gate.beginRequest());
     }
+    @Test public void stalledDocumentCanRecoverWithoutANavigationFinishedCallback() {
+        ChannelGate gate=new ChannelGate();
+        gate.validated(true);gate.navigationFinished();assertTrue(gate.beginRequest());
+        gate.navigationStarted();assertFalse(gate.beginRequest());
+        gate.recoverAfterNavigationDelay();assertTrue(gate.beginRequest());
+        for(int i=0;i<1000;i++){gate.validated(true);assertFalse(gate.beginRequest());}
+    }
+    @Test public void delayedRecoveryNeverGrantsOriginTrust() {
+        ChannelGate gate=new ChannelGate();gate.navigationStarted();
+        gate.recoverAfterNavigationDelay();assertFalse(gate.beginRequest());
+        gate.validated(false);assertFalse(gate.beginRequest());
+    }
 }

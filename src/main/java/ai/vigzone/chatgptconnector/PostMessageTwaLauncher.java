@@ -25,18 +25,24 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
     private boolean webAcknowledged;
     private String handshakeNonce="";
     private Runnable requestChannel;
-    private final Runnable recoverChannel=()->{
+    private final Runnable recoverChannel=this::recover;
+    private void recover(){
         if(destroyed||!tabVisible||webAcknowledged||session==null||!channelGate.isValidated())return;
-        if(!handshakeRetry.begin(android.os.SystemClock.uptimeMillis()))return;
+        if(!handshakeRetry.begin(android.os.SystemClock.uptimeMillis())){
+            ConnectionReport.record(activity,"Recovery state","Retry limit reached");return;
+        }
         // Only a delayed recovery may replace a silent channel. Relationship
         // callbacks cannot trigger recursive channel requests.
-        channelGate.rejected();
+        channelGate.recoverAfterNavigationDelay();
+        ConnectionReport.record(activity,"Recovery state","Retrying channel");
         if(requestChannel!=null)requestChannel.run();
-    };
+    }
     private void scheduleRecovery(){
         main.removeCallbacks(recoverChannel);
-        if(!webAcknowledged&&tabVisible&&!destroyed)
+        if(!webAcknowledged&&tabVisible&&!destroyed){
+            ConnectionReport.record(activity,"Recovery state","Scheduled");
             main.postDelayed(recoverChannel,Math.max(2000L,handshakeRetry.delayMillis()));
+        }
     }
     private void newDocument(){
         webAcknowledged=false;handshakeNonce="";handshakeRetry.reset();
@@ -76,23 +82,40 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
                 android.util.Log.i(TAG,"Navigation event="+event);
                 ConnectionReport.record(activity,"Navigation",Integer.toString(event));
                 quality.onNavigationEvent(event,extras);
-                if(event==NAVIGATION_STARTED){newDocument();channelGate.navigationStarted();if(!channelGate.isValidated())validationRetry.reset();}
-                if(event==NAVIGATION_FINISHED){channelGate.navigationFinished();validateOrigin();channel();}
+                if(event==NAVIGATION_STARTED){
+                    android.content.SharedPreferences report=activity.getSharedPreferences(ConnectionReport.STORE,Activity.MODE_PRIVATE);
+                    ConnectionReport.record(activity,"Before navigation",report.getString("Message channel","Waiting")+" / page "+report.getString("Page acknowledgment","Waiting")+" / retries "+report.getString("Channel retries","0"));
+                    newDocument();channelGate.navigationStarted();
+                    if(!channelGate.isValidated())validationRetry.reset();
+                    // Do not wait forever for a completion callback. External
+                    // intents and stalled optional resources may never emit one.
+                    scheduleRecovery();
+                }
+                if(event==NAVIGATION_FINISHED){
+                    channelGate.navigationFinished();validateOrigin();channel();
+                    // An early channel may belong to the previous document.
+                    // Probe it first: a live current page can acknowledge again
+                    // without replacing a port carrying an in-progress request.
+                    webAcknowledged=false;handshakeRetry.reset();hello();scheduleRecovery();
+                }
                 if(event==NAVIGATION_ABORTED||event==NAVIGATION_FAILED){channelGate.navigationFinished();scheduleRecovery();}
-                if(event==TAB_HIDDEN){tabVisible=false;main.removeCallbacks(recoverChannel);}
+                if(event==TAB_HIDDEN){tabVisible=false;main.removeCallbacks(recoverChannel);ConnectionReport.record(activity,"Recovery state","Paused while tab hidden");}
                 if(event==TAB_SHOWN){if(!tabVisible)validationRetry.reset();tabVisible=true;channelGate.tabShown();validateOrigin();channel();if(!webAcknowledged){handshakeRetry.reset();scheduleRecovery();}}
             }
             @Override public void onRelationshipValidationResult(int relation,Uri requested,boolean valid,Bundle extras){
                 android.util.Log.i(TAG,"Relationship="+relation+" valid="+valid+" expectedOrigin="+origin.equals(requested));
                 if(relation==CustomTabsService.RELATION_USE_AS_ORIGIN)ConnectionReport.record(activity,"Trust check",valid?"Verified":"Not verified by browser");
                 quality.onRelationshipValidationResult(relation,requested,valid,extras);
-                if(relation==CustomTabsService.RELATION_USE_AS_ORIGIN&&origin.equals(requested)){channelGate.validated(valid);channel();}
+                if(relation==CustomTabsService.RELATION_USE_AS_ORIGIN&&origin.equals(requested)){
+                    channelGate.validated(valid);channel();
+                    if(valid&&!webAcknowledged)scheduleRecovery();
+                }
             }
             @Override public void onMessageChannelReady(Bundle extras){
                 android.util.Log.i(TAG,"Channel ready");
                 ConnectionReport.record(activity,"Message channel","Ready");
                 quality.onMessageChannelReady(extras);
-                if(channelGate.isValidated())try{send(new org.json.JSONObject().put("connector","vigzone-chatgpt").put("version",1).put("nonce",handshakeNonce));}catch(org.json.JSONException ignored){}
+                hello();
             }
             @Override public void onPostMessage(String message,Bundle extras){
                 if(!channelGate.isValidated()||destroyed)return;
@@ -102,6 +125,7 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
                         if(!handshakeNonce.isEmpty()&&handshakeNonce.equals(control.optString("nonce"))){
                             webAcknowledged=true;main.removeCallbacks(recoverChannel);
                             ConnectionReport.record(activity,"Page acknowledgment","Received");
+                            ConnectionReport.record(activity,"Recovery state","Page connected");
                         }
                         return;
                     }
@@ -124,10 +148,15 @@ public final class PostMessageTwaLauncher extends TwaLauncher {
                 };
                 if(splash!=null)splash.configureTwaBuilder(builder,session,open);else open.run();
             }
-            @Override public void onServiceDisconnected(ComponentName name){session=null;channelGate.disconnected();}
+            @Override public void onServiceDisconnected(ComponentName name){session=null;channelGate.disconnected();ConnectionReport.record(activity,"Recovery state","Browser service disconnected");}
         };
         if(!CustomTabsClient.bindCustomTabsService(activity,provider,connection)){connection=null;super.launch(builder,quality,splash,completed,fallback);}
     }
+    private void hello(){
+        if(channelGate.isValidated()&&!handshakeNonce.isEmpty())try{
+            send(new org.json.JSONObject().put("connector","vigzone-chatgpt").put("version",1).put("nonce",handshakeNonce));
+        }catch(org.json.JSONException ignored){}
+    }
     private void send(org.json.JSONObject message){main.post(()->{if(!destroyed&&channelGate.isValidated()&&session!=null)ConnectionReport.record(activity,"Native message result",Integer.toString(session.postMessage(message.toString(),null)));});}
-    @Override public void destroy(){destroyed=true;main.removeCallbacksAndMessages(null);if(connection!=null){try{activity.unbindService(connection);}catch(IllegalArgumentException ignored){}connection=null;}super.destroy();}
+    @Override public void destroy(){destroyed=true;ConnectionReport.record(activity,"Recovery state","Launcher destroyed");main.removeCallbacksAndMessages(null);if(connection!=null){try{activity.unbindService(connection);}catch(IllegalArgumentException ignored){}connection=null;}super.destroy();}
 }

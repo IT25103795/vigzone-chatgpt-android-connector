@@ -21,7 +21,7 @@ public final class ConnectionStatusActivity extends Activity {
                 .append("\nAndroid: ").append(android.os.Build.VERSION.RELEASE)
                 .append("\nDevice: ").append(android.os.Build.MANUFACTURER).append(' ').append(android.os.Build.MODEL);
         android.content.SharedPreferences prefs=getSharedPreferences(ConnectionReport.STORE,MODE_PRIVATE);
-        for(String key:new String[]{"Browser","Browser version","Trust check","Validation attempts","Navigation","Message channel","Native message result","Page acknowledgment","Channel retries","Web request"})
+        for(String key:new String[]{"Browser","Browser version","Trust check","Validation attempts","Navigation","Message channel","Native message result","Page acknowledgment","Channel retries","Recovery state","Before navigation","Web request"})
             report.append('\n').append(key).append(": ").append(prefs.getString(key,"Not recorded"));
         // Only fixed, non-sensitive transport enums can arrive from the web link.
         for(String key:new String[]{"web_stage","web_origin"}){
