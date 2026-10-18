@@ -16,4 +16,23 @@ public class ProtocolTest {
         JSONArray input=Protocol.input(new JSONObject().put("text","question").put("history",history));assertEquals(2,input.length());assertEquals("assistant",input.getJSONObject(0).getString("role"));assertEquals("question",input.getJSONObject(1).getString("content"));
     }
     @Test(expected=IllegalArgumentException.class) public void rejectsEmptyQuestions() throws Exception{Protocol.input(new JSONObject().put("text","  "));}
+    @Test public void includesOlderConversationTurnsAndUntrustedMemory() throws Exception {
+        JSONArray history=new JSONArray().put(new JSONObject().put("role","user").put("content","My project uses PostgreSQL"));
+        for(int n=0;n<40;n++)history.put(new JSONObject().put("role",n%2==0?"assistant":"user").put("content","turn "+n));
+        JSONArray input=Protocol.input(new JSONObject().put("text","What database?").put("context","saved facts").put("history",history));
+        assertTrue(input.getJSONObject(0).getString("content").contains("Untrusted"));
+        assertEquals("My project uses PostgreSQL",input.getJSONObject(1).getString("content"));assertEquals(43,input.length());
+    }
+    @Test public void automaticallyRequestsSearchWithFreshnessAndMemoryInstructions() throws Exception {
+        JSONObject value=Protocol.payload(new JSONObject().put("text","Explain Astra"),"account-model");
+        assertEquals("web_search",value.getJSONArray("tools").getJSONObject(0).getString("type"));
+        assertEquals("auto",value.getString("tool_choice"));assertFalse(value.getBoolean("store"));assertTrue(value.getBoolean("stream"));
+        assertTrue(value.getString("instructions").contains("Current UTC time"));assertTrue(value.getString("instructions").contains("untrusted data"));
+    }
+    @Test public void sourceRecoveryOmitsUnsafeUrlsAndBoundsPublicMetadata() throws Exception {
+        JSONArray result=Protocol.publicSources(new JSONArray().put(new JSONObject().put("url","javascript:alert(1)"))
+                .put(new JSONObject().put("url","https://user:secret@example.com"))
+                .put(new JSONObject().put("url","https://example.com").put("title","Public source")));
+        assertEquals(1,result.length());assertEquals("Public source",result.getJSONObject(0).getString("title"));
+    }
 }

@@ -31,6 +31,7 @@ public final class ChatGptConnector {
     private final AtomicBoolean generating=new AtomicBoolean();
     private final java.util.concurrent.atomic.AtomicLong loginGeneration=new java.util.concurrent.atomic.AtomicLong();
     private volatile HttpURLConnection active;
+    private volatile boolean cancelled;
     private volatile String activeRequest="",activeScope="",loginScope="",loginError="";
     private volatile ServerSocket loginListener;
     private ChatGptConnector(Context context){this.context=context;store=new SecureStore(context);}
@@ -79,6 +80,7 @@ public final class ChatGptConnector {
     }
     private JSONObject status(String scope) throws Exception {
         JSONObject item=record(scope),result=new JSONObject().put("ok",true).put("connected",item!=null).put("pending",scope.equals(loginScope)&&loginListener!=null);
+        result.put("capabilities",new JSONObject().put("webSearch",true).put("vigzoneMemory",true));
         if(scope.equals(loginScope)&&!loginError.isEmpty())result.put("error",loginError);
         if(item!=null)result.put("identity",item.getString("sub")+":"+item.getString("client_id")).put("email",item.optString("email"));
         return result;
@@ -148,7 +150,7 @@ public final class ChatGptConnector {
     private static String safe(Exception error){return error instanceof SecurityException||error instanceof IllegalArgumentException||error instanceof IllegalStateException||error instanceof IOException?String.valueOf(error.getMessage()):"The ChatGPT connection could not complete. Please reconnect or retry.";}
     private synchronized void disconnect(String scope) throws Exception {
         if(scope.equals(loginScope)){loginGeneration.incrementAndGet();if(loginListener!=null)loginListener.close();}
-        if(scope.equals(activeScope)&&active!=null)active.disconnect();
+        if(scope.equals(activeScope)){cancelled=true;if(active!=null)active.disconnect();}
         store.write("account:"+SecureStore.key(scope),null);store.write("reply:"+SecureStore.key(scope),null);
     }
     public void dispatch(Activity activity,Uri returnUrl,String raw,Reply reply){
@@ -157,7 +159,7 @@ public final class ChatGptConnector {
             JSONObject request=new JSONObject(raw);String id=request.getString("id"),method=request.getString("method");JSONObject parameters=request.optJSONObject("params");
             if(parameters==null)parameters=new JSONObject();String scope=parameters.getString("accountId");SecureStore.key(scope);
             JSONObject args=parameters;
-            if("cancel".equals(method)){if(scope.equals(activeScope)&&args.optString("requestId").equals(activeRequest)&&active!=null)active.disconnect();reply.send(new JSONObject().put("id",id).put("ok",true));return;}
+            if("cancel".equals(method)){if(scope.equals(activeScope)&&args.optString("requestId").equals(activeRequest)){cancelled=true;if(active!=null)active.disconnect();}reply.send(new JSONObject().put("id",id).put("ok",true));return;}
             work.execute(()->{try{
                 JSONObject result;
                 switch(method){
@@ -182,29 +184,42 @@ public final class ChatGptConnector {
         if(!generating.compareAndSet(false,true))throw new IllegalStateException("A ChatGPT response is already in progress.");
         try{
             if(store.read("reply:"+SecureStore.key(scope))!=null)throw new IllegalStateException("Recover the previous completed ChatGPT reply before sending another request.");
-            JSONObject account=token(scope);String identity=account.getString("sub")+":"+account.getString("client_id");
+            cancelled=false;JSONObject account=token(scope);String identity=account.getString("sub")+":"+account.getString("client_id");
             if(!Protocol.equal(identity,request.optString("expectedAccount")))throw new SecurityException("Confirm your connected ChatGPT account again before sending.");
             String model=request.getString("model");if(!model.matches("[A-Za-z0-9._:/-]{1,120}"))throw new IllegalArgumentException("Choose a model reported by your ChatGPT account.");
-            JSONObject payload=new JSONObject().put("model",model).put("input",Protocol.input(request)).put("store",false).put("stream",true);
+            JSONObject payload=Protocol.payload(request,model);
             activeRequest=request.getString("requestId");activeScope=scope;
             active=connect("https://api.openai.com/v1/responses","POST",account.getString("access_token"),payload.toString(),false);
-            if(active.getResponseCode()!=200){json(active);throw new IOException("ChatGPT did not start a response.");}
-            StringBuilder text=new StringBuilder();boolean complete=false;StringBuilder data=new StringBuilder();
-            try(BufferedReader input=new BufferedReader(new InputStreamReader(active.getInputStream(),StandardCharsets.UTF_8))){
-                String line;while((line=input.readLine())!=null){
-                    if(line.startsWith("data:")){data.append(line.substring(5).trim());if(data.length()>2*1024*1024)throw new IOException("ChatGPT event exceeded the supported size.");continue;}
-                    if(!line.isEmpty()||data.length()==0)continue;
-                    if("[DONE]".contentEquals(data)){data.setLength(0);break;}
-                    JSONObject event=new JSONObject(data.toString());data.setLength(0);String type=event.optString("type");
-                    if("response.output_text.delta".equals(type)){
-                        String delta=event.optString("delta");text.append(delta);if(text.length()>2*1024*1024)throw new IOException("ChatGPT reply exceeded the supported size.");
-                        reply.send(new JSONObject().put("id",id).put("event","delta").put("delta",delta));
-                    }else if("response.completed".equals(type)){complete=true;break;}
-                    else if("response.failed".equals(type)||"response.incomplete".equals(type)||"error".equals(type))throw new IOException("ChatGPT could not finish this response. Check your subscription allowance and retry.");
+            boolean searchUnavailable=false;
+            if(active.getResponseCode()!=200&&payload.has("tools")){
+                int code=active.getResponseCode();
+                if(code==400||code==403||code==422){
+                    String detail=read(active.getErrorStream()).toLowerCase(java.util.Locale.ROOT);
+                    if(detail.contains("web_search")||detail.contains("web search")||detail.contains("tool_choice")||detail.contains("tools")){
+                        active.disconnect();if(cancelled)throw new IOException("Request cancelled.");
+                        payload.remove("tools");payload.remove("tool_choice");
+                        payload.put("instructions",payload.getString("instructions")+" Built-in web search is unavailable for this request. Use only supplied Vigzone live sources for fresh facts and cite their actual URLs. If no live evidence is supplied, explicitly say current facts could not be verified. Never claim a successful search.");
+                        active=connect("https://api.openai.com/v1/responses","POST",account.getString("access_token"),payload.toString(),false);
+                        searchUnavailable=true;
+                    }
                 }
             }
-            if(!complete||text.toString().trim().isEmpty())throw new IOException("ChatGPT's response was interrupted before completion. Please retry.");
-            JSONObject result=new JSONObject().put("ok",true).put("content",text.toString()).put("model",model).put("requestId",activeRequest).put("conversationId",request.optString("conversationId"));
+            if(active.getResponseCode()!=200){json(active);throw new IOException("ChatGPT did not start a response.");}
+            ResponseEvents events=new ResponseEvents();StringBuilder data=new StringBuilder();boolean searchAnnounced=false;
+            try(BufferedReader input=new BufferedReader(new InputStreamReader(active.getInputStream(),StandardCharsets.UTF_8))){
+                String line;while((line=input.readLine())!=null){
+                    if(cancelled)throw new IOException("Request cancelled.");
+                    if(line.startsWith("data:")){if(data.length()>0)data.append('\n');data.append(line.substring(5).trim());if(data.length()>2*1024*1024)throw new IOException("ChatGPT event exceeded the supported size.");continue;}
+                    if(!line.isEmpty()||data.length()==0)continue;
+                    if("[DONE]".contentEquals(data)){data.setLength(0);break;}
+                    JSONObject event=new JSONObject(data.toString());data.setLength(0);events.accept(event);
+                    if("response.output_text.delta".equals(event.optString("type")))reply.send(new JSONObject().put("id",id).put("event","delta").put("delta",event.optString("delta")));
+                    if(events.searched&&!searchAnnounced){searchAnnounced=true;reply.send(new JSONObject().put("id",id).put("event","status").put("status","searching"));}
+                    if(events.complete)break;
+                }
+            }
+            if(cancelled)throw new IOException("Request cancelled.");
+            JSONObject result=events.result().put("contextSources",Protocol.publicSources(request.optJSONArray("sources"))).put("webSearchUnavailable",searchUnavailable).put("ok",true).put("model",model).put("requestId",activeRequest).put("conversationId",request.optString("conversationId"));
             synchronized(this){JSONObject stillConnected=record(scope);if(stillConnected==null||!identity.equals(stillConnected.optString("sub")+":"+stillConnected.optString("client_id")))throw new SecurityException("This ChatGPT account was disconnected before the reply finished.");store.write("reply:"+SecureStore.key(scope),result);}return result;
         }finally{if(active!=null)active.disconnect();active=null;activeRequest="";activeScope="";generating.set(false);}
     }
