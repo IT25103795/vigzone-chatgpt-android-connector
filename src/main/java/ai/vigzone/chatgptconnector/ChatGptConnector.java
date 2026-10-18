@@ -20,6 +20,9 @@ import org.json.*;
 /** Open-source, on-device OAuth/Responses client. No hosted credential proxy. */
 public final class ChatGptConnector {
     public interface Reply { void send(JSONObject value); }
+    public interface CompletionListener { void completed(String accountId,JSONObject request,JSONObject result); }
+    private volatile CompletionListener completionListener;
+    public void setCompletionListener(CompletionListener listener){completionListener=listener;}
     interface Connections { HttpURLConnection open(URL target) throws IOException; }
     private static Connections connections=target->(HttpURLConnection)target.openConnection();
     private static ChatGptConnector instance;
@@ -201,6 +204,8 @@ public final class ChatGptConnector {
                 if(!"queued".equals(job.optString("state"))){finishInterrupted("Android interrupted this response. Your saved partial reply is retained; retry to continue.");return;}
                 String scope=job.getString("scope");JSONObject request=job.getJSONObject("request");
                 JSONObject result=chat(scope,observerId,request,value->{Reply target=observer;if(target!=null)target.send(value);});
+                CompletionListener listener=completionListener;
+                if(listener!=null)try{listener.completed(scope,request,result);}catch(RuntimeException ignored){/* Notification delivery cannot discard a saved reply. */}
                 Reply target=observer;if(target!=null)target.send(result.put("id",observerId));
                 synchronized(this){generation=null;store.write("generation",null);}
             }catch(Exception error){try{finishInterrupted(safe(error));}catch(Exception ignored){}}
